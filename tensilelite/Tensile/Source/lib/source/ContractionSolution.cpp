@@ -32,7 +32,6 @@
 #include <Tensile/ContractionProblem.hpp>
 #include <Tensile/Utils.hpp>
 
-#include <random>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -57,28 +56,39 @@ namespace TensileLite
             __device__ __host__ inline constexpr N safe_ceil_div(N n, D d)
             {
                 // Static cast to undo integral promotion.
-                return static_cast<N>(n / d + (n % d != 0 ? 1 : 0));
+                return static_cast<N>(d == 0 ? 0 : (n / d + (n % d != 0 ? 1 : 0)));
             }
         } // namespace math
 
-        constexpr size_t num_iters_per_cta(
-            size_t BLK_M, size_t BLK_N, size_t BLK_K, size_t m, size_t n, size_t k, int g)
+        constexpr size_t num_iters_total(size_t output_tiles, size_t iters_per_tile)
         {
-            return math::safe_ceil_div(math::safe_ceil_div(m, BLK_M) * math::safe_ceil_div(n, BLK_N)
-                                           * math::safe_ceil_div(k, BLK_K),
-                                       g);
+            return output_tiles * iters_per_tile;
         }
 
-        constexpr size_t number_of_output_tiles(size_t BLK_M, size_t BLK_N, size_t m, size_t n)
+        constexpr size_t num_iters_per_tile(size_t BLK_K, size_t k)
+        {
+            return math::safe_ceil_div(k, BLK_K);
+        }
+
+        constexpr size_t num_iters_per_cta(size_t iters_total, int g)
+        {
+            return math::safe_ceil_div(iters_total, g);
+        }
+
+        constexpr size_t number_of_output_tiles(size_t BLK_M, size_t BLK_N, size_t m, size_t n, size_t batch)
         {
             size_t m_tiles = math::safe_ceil_div(m, BLK_M);
             size_t n_tiles = math::safe_ceil_div(n, BLK_N);
-            return m_tiles * n_tiles;
+            return m_tiles * n_tiles * batch;
         }
 
-        constexpr size_t num_fixup_peers(size_t BLK_K, size_t k, size_t iters_per_cta)
+        constexpr size_t num_fixup_peers(size_t iters_total, size_t iters_per_tile, size_t iters_per_cta)
         {
-            return math::safe_ceil_div(math::safe_ceil_div(k, BLK_K), iters_per_cta);
+            // If tiles don't evenly divide there are always at least 2 fixup peers, and more if iters_per_tile > iters_per_cta
+            // size_t hasFixup = (iters_total % g == 0 && // Check if some WGs have more iters than others
+            //                    iters_per_cta % iters_per_tile == 0) // Check if WGs have an even number of full tiles
+            //                    ? 0 : 1;
+            return math::safe_ceil_div(iters_per_tile, iters_per_cta); // + hasFixup;
         }
 
         std::tuple<double, size_t, size_t> predicted_runtime(size_t BLK_M,
@@ -87,14 +97,18 @@ namespace TensileLite
                                                              size_t m,
                                                              size_t n,
                                                              size_t k,
+                                                             size_t batch,
                                                              int    g,
                                                              double a,
                                                              double b,
                                                              double c,
                                                              double d)
         {
-            size_t iters_per_cta = num_iters_per_cta(BLK_M, BLK_N, BLK_K, m, n, k, g);
-            size_t fixup_peers   = num_fixup_peers(BLK_K, k, iters_per_cta);
+            size_t output_tiles   = number_of_output_tiles(BLK_M, BLK_N, m, n, batch);
+            size_t iters_per_tile = num_iters_per_tile(BLK_K, k); // maximum iters per tile, including extra iters when uneven
+            size_t iters_total    = num_iters_total(output_tiles, iters_per_tile);
+            size_t iters_per_cta  = num_iters_per_cta(iters_total, g);
+            size_t fixup_peers    = num_fixup_peers(iters_total, iters_per_tile, iters_per_cta);
 
             return {a + (b * (fixup_peers > 1)) + (c * iters_per_cta) + (d * (fixup_peers - 1)),
                     iters_per_cta,
@@ -107,8 +121,9 @@ namespace TensileLite
                                      size_t m,
                                      size_t n,
                                      size_t k,
-                                     int    grid_start = 1,
-                                     int    grid_end   = 304)
+                                     size_t batch,
+                                     int    grid_start,
+                                     int    grid_end)
         {
             static const bool debug = Debug::Instance().printStreamKGridInfo();
 
@@ -139,14 +154,14 @@ namespace TensileLite
             for(; g <= grid_end; ++g)
             {
                 auto [runtime, iters_per_cta, fixup_peers]
-                    = predicted_runtime(BLK_M, BLK_N, BLK_K, m, n, k, g, a, b, c, d);
+                    = predicted_runtime(BLK_M, BLK_N, BLK_K, m, n, k, batch, g, a, b, c, d);
 
                 if(debug)
                 {
                     std::cout << "grid size: " << g << ", runtime: " << runtime
                               << ", iters_per_cta: " << iters_per_cta
                               << ", fixup_peers: " << fixup_peers << ", m: " << m << ", n: " << n
-                              << ", k: " << k << ", a: " << a << ", b: " << b << ", c: " << c
+                              << ", k: " << k << ", batch: " << batch << ", a: " << a << ", b: " << b << ", c: " << c
                               << ", d: " << d << std::endl;
                 }
 
@@ -160,7 +175,7 @@ namespace TensileLite
             if(debug)
             {
                 std::cout << "Number of Output Tiles: "
-                          << number_of_output_tiles(BLK_M, BLK_N, m, n) << std::endl;
+                          << number_of_output_tiles(BLK_M, BLK_N, m, n, batch) << std::endl;
                 std::cout << "Minimum runtime: " << min_grid_runtime.second
                           << " @ grid size: " << min_grid_runtime.first << std::endl;
             }
@@ -643,9 +658,9 @@ namespace TensileLite
     template <bool T_Debug, bool insertKernelArgs, typename KA>
     void ContractionSolution::singleCallArgs(ContractionSolution::Problem const& problem,
                                              ContractionInputs const&            inputs,
-                                             uint32_t const&                     workspaceOffsetInByte,
-                                             Hardware const*                     hardware,
-                                             KA&                                 args) const
+                                             uint32_t const& workspaceOffsetInByte,
+                                             Hardware const* hardware,
+                                             KA&             args) const
     {
         if(debugKernel)
         {
@@ -722,10 +737,7 @@ namespace TensileLite
             // Assert hardware is not null
             // For now grouped gemm is not supported and passes nullptr
             TENSILE_ASSERT_EXC(hardware != nullptr);
-            size_t cuCount = 0;
-            
-            auto   tiles   = problem.getNumTiles(sizeMapping);
-            size_t skGrid  = getSKGrid(problem, *hardware, tiles);
+
             // StreamK workspace + flags
             args.template append<void const*>("ws", inputs.ws);
             args.template append<void*>("Flags", inputs.Synchronizer);
@@ -918,8 +930,8 @@ namespace TensileLite
         return rv.numWorkItems.x / rv.workGroupSize.x / rv.workGroupSize.y / rv.workGroupSize.z;
     }
 
-    inline uint32_t getNumWorkGroups(ContractionSolution::Problem const&     problem,
-                                     const SizeMapping& sizeMapping)
+    inline uint32_t getNumWorkGroups(ContractionSolution::Problem const& problem,
+                                     const SizeMapping&                  sizeMapping)
     {
         size_t numWorkGroupsX = 1;
         size_t numWorkGroupsY = 1;
@@ -1157,7 +1169,8 @@ namespace TensileLite
 
         if(internalArgsSupport.useUniversalArgs)
         {
-            kernelArgs<T_Debug, false>(1, 0, rv.args, getNumWorkGroups(rv), &hardware, problem.getParams());
+            kernelArgs<T_Debug, false>(
+                1, 0, rv.args, getNumWorkGroups(rv), &hardware, problem.getParams());
         }
         singleCallArgs<T_Debug, true>(problem, inputs, 0, &hardware, rv.args);
 
@@ -1178,7 +1191,9 @@ namespace TensileLite
 
         if(sizeMapping.streamK != 0)
         {
-            auto     itersPerTile = problem.getItersPerTile(sizeMapping);
+            // Clamp minimum iters per tile to 1 to allow stream-k index calculation to work in case K==0
+            // In this case no actual iterations will be run, but workgroups will be mapped correctly for beta*C
+            auto     itersPerTile = max(1, problem.getItersPerTile(sizeMapping));
             auto     totalIters   = tiles * itersPerTile;
             uint32_t magicNumberItersPerTile;
             uint32_t magicShiftItersPerTile;
@@ -1194,9 +1209,9 @@ namespace TensileLite
             magicNumProblemNumGroupTiles0By1
                 = magicNumber(2, numGroupTiles0x1, &magicShiftProblemNumGroupTiles0By1);
             rv.args.append<uint32_t>("magicNumProblemNumGroupTiles0By1",
-                                        magicNumProblemNumGroupTiles0By1);
+                                     magicNumProblemNumGroupTiles0By1);
             rv.args.append<uint32_t>("magicShiftProblemNumGroupTiles0By1",
-                                        magicShiftProblemNumGroupTiles0By1);
+                                     magicShiftProblemNumGroupTiles0By1);
 
             rv.args.append<uint32_t>("totalIters", totalIters);
             if(sizeMapping.streamK == 1) // Basic SK
@@ -1247,12 +1262,12 @@ namespace TensileLite
     }
 
     template <typename KA>
-    void
-        ContractionSolution::calculateSingleCallWorkGroupItems(std::vector<Problem> const& problems,
-                                                               const TensileLite::dim3& workGroupSize,
-                                                               TensileLite::dim3&       numWorkGroups,
-                                                               TensileLite::dim3&       numWorkItems,
-                                                               KA&                  h_args) const
+    void ContractionSolution::calculateSingleCallWorkGroupItems(
+        std::vector<Problem> const& problems,
+        const TensileLite::dim3&    workGroupSize,
+        TensileLite::dim3&          numWorkGroups,
+        TensileLite::dim3&          numWorkItems,
+        KA&                         h_args) const
     {
 
         uint32_t wgLeft  = 0;
@@ -1321,7 +1336,7 @@ namespace TensileLite
     KernelInvocation ContractionSolution::generateSingleCallGroupedGemm(
         std::vector<ContractionSolution::Problem> const& problems,
         ContractionSolution::GroupedInputs const&        inputs,
-        Hardware const&                                hardware,
+        Hardware const&                                  hardware,
         KA&                                              h_args,
         void const*                                      userArgs) const
     {
@@ -1405,8 +1420,12 @@ namespace TensileLite
                 rv.args.append<uint32_t>("numWorkGroups",
                                          rv.numWorkItems.x / rv.workGroupSize.x / rv.workGroupSize.y
                                              / rv.workGroupSize.z);
-                kernelArgs<T_Debug, true>(
-                    0, (uint32_t)KERNELARGTYPE::NORMAL, rv.args, 0, &hardware, problems[0].getParams());
+                kernelArgs<T_Debug, true>(0,
+                                          (uint32_t)KERNELARGTYPE::NORMAL,
+                                          rv.args,
+                                          0,
+                                          &hardware,
+                                          problems[0].getParams());
             }
 
             rv.args.append<void const*>("Synchronizer", (void*)inputs.grouped[0].Synchronizer);
@@ -1847,9 +1866,9 @@ namespace TensileLite
     void ContractionSolution::calculateConversionCallWorkGroupItems(
         std::vector<ContractionSolution::Problem> const& problems,
         size_t&                                          vw,
-        const TensileLite::dim3&                             workGroupSize,
-        TensileLite::dim3&                                   numWorkGroups,
-        TensileLite::dim3&                                   numWorkItems,
+        const TensileLite::dim3&                         workGroupSize,
+        TensileLite::dim3&                               numWorkGroups,
+        TensileLite::dim3&                               numWorkItems,
         KA&                                              h_args) const
     {
         if constexpr(std::is_same<KA, KernelArguments>::value)
@@ -1943,7 +1962,7 @@ namespace TensileLite
     KernelInvocation ContractionSolution::generateOutputConversionCallGroupedGemm(
         std::vector<ContractionSolution::Problem> const& problems,
         ContractionSolution::GroupedInputs const&        inputs,
-        Hardware const&                                 hardware,
+        Hardware const&                                  hardware,
         KA&                                              h_args) const
     {
         KernelInvocation rv;
@@ -2124,13 +2143,13 @@ namespace TensileLite
         if(problemType.activationType != ActivationType::None)
         {
             if(problemType.activationType == ActivationType::All)
-	    {
-		name += "_A";
-	    }
-	    else if(problemType.activationType == ActivationType::Hipblaslt_all)
-	    {
+            {
+                name += "_A";
+            }
+            else if(problemType.activationType == ActivationType::Hipblaslt_all)
+            {
                 name += "_HA";
-	    }
+            }
             else
             {
                 std::string actName = ToString(problemType.activationType);
@@ -2283,13 +2302,13 @@ namespace TensileLite
         if(problemType.activationType != ActivationType::None)
         {
             if(problemType.activationType == ActivationType::All)
-	    {
-		name += "_A";
-	    }
+            {
+                name += "_A";
+            }
             else if(problemType.activationType == ActivationType::Hipblaslt_all)
-	    {
+            {
                 name += "_HA";
-	    }
+            }
             else
             {
                 std::string actName = ToString(problemType.activationType);
@@ -2700,11 +2719,11 @@ namespace TensileLite
         if(sizeMapping.globalAccumulation == 2 && gsu > 1)
         {
             if(debug)
-                rv.push_back(
-                    generateOutputConversionCallGroupedGemm<true>(problems, inputs, hardware, h_args));
+                rv.push_back(generateOutputConversionCallGroupedGemm<true>(
+                    problems, inputs, hardware, h_args));
             else
-                rv.push_back(
-                    generateOutputConversionCallGroupedGemm<false>(problems, inputs, hardware, h_args));
+                rv.push_back(generateOutputConversionCallGroupedGemm<false>(
+                    problems, inputs, hardware, h_args));
         }
 
         if(debug)
@@ -2748,9 +2767,11 @@ namespace TensileLite
         // Here we only update the pointer
         int h_args = 1; // Dummy
         if(debug)
-            rv.push_back(generateSingleCallGroupedGemm<true>(problems, inputs, hardware, h_args, dUA));
+            rv.push_back(
+                generateSingleCallGroupedGemm<true>(problems, inputs, hardware, h_args, dUA));
         else
-            rv.push_back(generateSingleCallGroupedGemm<false>(problems, inputs, hardware, h_args, dUA));
+            rv.push_back(
+                generateSingleCallGroupedGemm<false>(problems, inputs, hardware, h_args, dUA));
 
         auto gsu = problems[0].getParams().gsu() > 0 ? problems[0].getParams().gsu()
                                                      : sizeMapping.globalSplitU;
@@ -2796,7 +2817,7 @@ namespace TensileLite
             throw std::runtime_error("Unsupported Device memory type.");
         }
 
-        return solveGroupedGemmGPU(problems, inputs,hardware, *dUA, inputs.ws, stream);
+        return solveGroupedGemmGPU(problems, inputs, hardware, *dUA, inputs.ws, stream);
     }
 
     void ContractionSolution::relaseDeviceUserArgs(void* dUA, void* dUAHost)
@@ -2934,8 +2955,8 @@ namespace TensileLite
         else
         {
             // TODO: Pass GSU from problem and change value[2] to gsu if gsu != default value
-            size_t gsu
-                = problem.getParams().gsu() > 0 ? problem.getParams().gsu() : sizeMapping.globalSplitU;
+            size_t gsu           = problem.getParams().gsu() > 0 ? problem.getParams().gsu()
+                                                                 : sizeMapping.globalSplitU;
             size_t gsuMultiplier = gsu > 1 ? gsu : 0;
 
             size += problem.d().totalLogicalElements() * sizeMapping.workspaceSizePerElemC
@@ -2945,16 +2966,19 @@ namespace TensileLite
             {
                 if(problem.biasSrc() == ContractionProblemGemm::TENSOR::A)
                 {
-                    size += problem.freeSizeA(0) * sizeMapping.workspaceSizePerElemBias * gsuMultiplier;
+                    size += problem.freeSizeA(0) * sizeMapping.workspaceSizePerElemBias
+                            * gsuMultiplier;
                 }
                 else if(problem.biasSrc() == ContractionProblemGemm::TENSOR::B)
                 {
-                    size += problem.freeSizeB(0) * sizeMapping.workspaceSizePerElemBias * gsuMultiplier;
+                    size += problem.freeSizeB(0) * sizeMapping.workspaceSizePerElemBias
+                            * gsuMultiplier;
                 }
-                else if(problem.biasSrc() == ContractionProblemGemm::TENSOR::D && (gsuMultiplier == 0))
+                else if(problem.biasSrc() == ContractionProblemGemm::TENSOR::D
+                        && (gsuMultiplier == 0))
                 {
-                    size += problem.d().totalLogicalElements() * sizeMapping.workspaceSizePerElemBias
-                            * gsu;
+                    size += problem.d().totalLogicalElements()
+                            * sizeMapping.workspaceSizePerElemBias * gsu;
                 }
             }
 
@@ -2964,21 +2988,14 @@ namespace TensileLite
                 auto numWGS = getNumWorkGroups(problem, sizeMapping);
                 size += problem.amaxd().elementBytes() * numWGS;
             }
-
-            // Custom kernel synchronizer
-            if(gsu > 1 && sizeMapping.globalAccumulation == 3)
-            {
-                size += (int)ceil(problem.d().sizes()[0] / (float)sizeMapping.macroTile.x)
-                        * (int)ceil(problem.d().sizes()[1] / (float)sizeMapping.macroTile.y)
-                        * sizeMapping.waveNum * sizeof(int32_t);
-            }
         }
 
         return size;
     }
 
-    size_t ContractionSolution::requiredWorkspaceSizeGroupedGemm(
-        std::vector<Problem> const& problems, Hardware const& hardware) const
+    size_t
+        ContractionSolution::requiredWorkspaceSizeGroupedGemm(std::vector<Problem> const& problems,
+                                                              Hardware const& hardware) const
     {
         size_t sizeInByte = 0;
 
@@ -3001,7 +3018,8 @@ namespace TensileLite
         return sizeInByte;
     }
 
-    size_t ContractionSolution::requiredHostSizeGroupedGemmSingle(Problem const& problem, Hardware const& hardware) const
+    size_t ContractionSolution::requiredHostSizeGroupedGemmSingle(Problem const&  problem,
+                                                                  Hardware const& hardware) const
     {
         if(!problemType.groupedGemm)
             return 0;
@@ -3021,8 +3039,19 @@ namespace TensileLite
         return h_args.size();
     }
 
-    size_t ContractionSolution::getSKGrid(Problem const&  problem, Hardware const& hardware, size_t tiles) const
+    size_t ContractionSolution::getSKGrid(Problem const&  problem,
+                                          Hardware const& hardware,
+                                          size_t          tiles) const
     {
+        // If K==0, run kernel as DP with Alpha=0 to skip main loop and apply beta*c
+        size_t z = 1;
+        for(size_t i = 0; i < problem.boundIndices().size(); ++i)
+        {
+            z *= problem.boundSize(i);
+        }
+        if(z == 0)
+            return tiles;
+
         AMDGPU const* pAMDGPU = dynamic_cast<AMDGPU const*>(&hardware);
 
         assert(pAMDGPU != nullptr && pAMDGPU->computeUnitCount != 0);
@@ -3072,7 +3101,7 @@ namespace TensileLite
         {
             size_t x = 1;
             size_t y = 1;
-            size_t z = 1;
+            size_t batch = 1;
             for(size_t i = 0; i < problem.freeIndicesA().size(); i++)
             {
                 x *= problem.freeSizeA(i);
@@ -3081,10 +3110,9 @@ namespace TensileLite
             {
                 y *= problem.freeSizeB(i);
             }
-            // TODO Batch dimension
-            for(size_t i = 0; i < problem.boundIndices().size(); ++i)
+            for(size_t i = 0; i < problem.batchIndices().size(); ++i)
             {
-                z *= problem.boundSize(i);
+                batch *= problem.batchSize(i);
             }
 
             return streamk::best_predicted_grid_size(sizeMapping.macroTile.x,
@@ -3093,6 +3121,7 @@ namespace TensileLite
                                                      x,
                                                      y,
                                                      z,
+                                                     batch,
                                                      1,
                                                      cuCount);
         }

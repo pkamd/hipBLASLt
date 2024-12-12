@@ -2366,7 +2366,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # Open persistent loop
     loopComponent = Component.PersistentLoop.find(self)
     module.add(loopComponent.openPersistentLoop(self, kernel))
-        
+
     module.add(self.setupNewTile(kernel, tensorParametersA, tensorParametersB, isOptNLL=False))
 
     if self.do["executeToPrefetchEnd"]:
@@ -2589,7 +2589,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # need to unroll tail loop for the following cases
       mEnd = 1
-      if kernel["ProblemType"]["Sparse"]:
+      if kernel["ProblemType"]["Sparse"] and kernel["DirectToVgprSparseMetadata"]:
         mEnd = kernel["LoopIters"]
       if (kernel["DirectToVgprA"] or kernel["DirectToVgprB"] or kernel["DirectToLdsA"] or kernel["DirectToLdsB"]):
         mEnd = kernel["DepthU"]//(kernel["MatrixInstK"]*kernel["LocalSplitU"])
@@ -2630,17 +2630,26 @@ class KernelWriter(metaclass=abc.ABCMeta):
       if self.isSwapGlobalReadOrderForDtvOrDtl(kernel):
         tensorParameters1st, tensorParameters2nd = tensorParameters2nd, tensorParameters1st
         tc1, tc2 = tc2, tc1
+
+      globalReadMode1st = 2 if (((tensorParameters1st["glvw"] * tensorParameters1st["bpeGR"]) < 4) or \
+                               kernel["tailLoopOpt"] == False) else 0
+      globalReadMode2nd = 2 if (((tensorParameters2nd["glvw"] * tensorParameters2nd["bpeGR"]) < 4) or \
+                               kernel["tailLoopOpt"] == False) else 0
       module.addComment1("Update M0 for DTLDS")
       moduleTmp = self.directToLdsM0Update(kernel, 1, tensorParameters1st)
       module.add(replaceHolder(moduleTmp, 0))
       module.addComment1("global read %s"%tc1)
-      module.add(self.globalReadDo(kernel, 2, tensorParameters1st))
+      module.add(self.globalReadDo(kernel, globalReadMode1st, tensorParameters1st))
       module.addComment1("Update M0 for DTLDS")
       moduleTmp = self.directToLdsM0Update(kernel, 1, tensorParameters2nd)
       module.add(replaceHolder(moduleTmp, 0))
       module.addComment1("global read %s"%tc2)
-      module.add(self.globalReadDo(kernel, 2, tensorParameters2nd))
-      module.add(self._wait(kernel, tensorParametersA, tensorParametersB, 0, -1, -1, "2wait for global read"))
+      module.add(self.globalReadDo(kernel, globalReadMode2nd, tensorParameters2nd))
+      if kernel["tailLoopOpt"] and \
+         (((tensorParameters1st["glvw"] * tensorParameters1st["bpeGR"]) >= 4) or \
+          ((tensorParameters2nd["glvw"] * tensorParameters2nd["bpeGR"]) >= 4)):
+        module.add(self.tailLoopGlobalRead(kernel, tensorParameters1st, tensorParameters2nd))
+      module.add(self._wait(kernel, tensorParameters1st, tensorParameters2nd, 0, -1, -1, "2wait for global read"))
       module.add(self._syncThreads(kernel))
 
       # the following read/write addresses could be modified in recalcLocal(Read|Write)Addresses due to policy change
@@ -2815,29 +2824,17 @@ class KernelWriter(metaclass=abc.ABCMeta):
     ####################################
     #if kernel["NumThreads"]%kernel["MacroTile0"] == 0:
     if kernel["LocalSplitU"] > 1:
-      module.addComment2("LocalSplitU Reduction")
-      module.add(self._syncThreads(kernel))
-
-      # LocalSplitU: local write
-      module.addComment1("LocalSplitU: local write")
-      module.add(self.localSplitULocalWrite(kernel))
-
-      # LocalSplitU: local read
-      module.addComment1("LocalSplitU: local read")
-      module.add(self.localSplitULocalRead(kernel))
+      module.addComment1("LocalSplitU: local write and read")
+      lsuComponent = Component.LSU.find(self)
+      module.add(lsuComponent.writeReadReduction(self, kernel))
 
       # LocalSplitU: global write indices
-      # Hide instructions in local read latency
       module.addComment1("LocalSplitU: global write indices")
-      module.add(self.localSplitUGlobalWriteIndices(kernel))
-
-      # LocalSplitU: Reduction
-      module.addComment1("LocalSplitU: reduction")
-      module.add(self.localSplitUReduction(kernel))
+      module.add(lsuComponent.globalWriteIndices(self, kernel))
 
       # LocalSplitU: global write
       module.addComment1("LocalSplitU: global write")
-      module.add(self.localSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+      module.add(lsuComponent.globalWrite(self, kernel, tensorParametersA, tensorParametersB))
 
     else:
       ####################################
@@ -2852,9 +2849,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.addComment1("not-LocalSplitU: global write")
       module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
 
-    # function suffix
     module.add(self.functionEnd(kernel, addLabel=True))
-    module.add(self.functionSuffix(kernel))
 
     # Tensile pass
     tpo = TensilePassOptions()
@@ -3264,7 +3259,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.states.bpeCexternal = self.states.bpeCexternalGSU1
     if kernel["_GlobalAccumulation"] and kernel["_GlobalAccumulation"] != 'PartialsBuffer':
       self.states.bpeCexternal = self.states.bpeCinternal
-      
+
 
     # special case for wmma h and b
     if (kernel["EnableMatrixInstruction"]
@@ -4071,7 +4066,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("AddressWS", numSgprAddressWS)
       self.defineSgpr("AddressFlags", numSgprAddressFlags)
       self.states.numSgprStreamK += numSgprAddressWS + numSgprAddressFlags
-    
+
     #asm input interface depen
     self.defineSgpr("StridesD", self.states.d.numSgprStrides)
     self.defineSgpr("StridesC", self.states.c.numSgprStrides)
@@ -4144,7 +4139,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("StreamKLocalEnd", 1)
       if kernel["StreamKAtomic"] == 0:
         self.defineSgpr("SrdWS", 4, 4)
-    
+
     #------------------------
     # Registers defined below this point are not available in the post-loop
     # Post-loop is after tail loop exits, ie the store code.
@@ -4515,6 +4510,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     tP["localWriteSwapByteOffset"] = 0
     tP["gpr"] = {}
     tP["metadataWriteSwapByteOffset"] = 0
+    tP["isSwizzled"] = (kernel["ProblemType"]["SwizzleTensorB"] and tP["isB"]) or (kernel["ProblemType"]["SwizzleTensorA"] and tP["isA"])
 
   ##############################################################################
   # Global Read Addresses: Tile Assignment A/B
@@ -4832,27 +4828,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     return ""
 
   ##############################################################################
-  # LocalSplitU: Local Write
-  ##############################################################################
-  @abc.abstractmethod
-  def localSplitULocalWrite(self, kernel):
-    return ""
-
-  ##############################################################################
-  # LocalSplitU: Local Read
-  ##############################################################################
-  @abc.abstractmethod
-  def localSplitULocalRead(self, kernel):
-    return ""
-
-  ##############################################################################
-  # LocalSplitU: Reduction
-  ##############################################################################
-  @abc.abstractmethod
-  def localSplitUReduction(self, kernel):
-    return ""
-
-  ##############################################################################
   # globalWriteWorkGroupInit:
   # Perform work-group granularity init
   ##############################################################################
@@ -4925,13 +4900,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
   ##############################################################################
   @abc.abstractmethod
   def isSwapGlobalReadOrderForDtvOrDtl(self, kernel, prefetch1=False):
-    return ""
-
-  ##############################################################################
-  # Function Suffix
-  ##############################################################################
-  @abc.abstractmethod
-  def functionSuffix(self, kernel):
     return ""
 
   ##############################################################################

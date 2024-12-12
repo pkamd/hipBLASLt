@@ -2588,8 +2588,8 @@ class VCvtFP8toF32(VCvtInstruction):
         self.setInst("v_cvt_f32_fp8")
 
 class VCvtBF8toF32(VCvtInstruction):
-    def __init__(self, dst, src, sdwa: Optional[SDWAModifiers] = None, comment="") -> None:
-        super().__init__(CvtType.CVT_BF8_to_F32, dst, src, sdwa, None, comment)
+    def __init__(self, dst, src, sdwa: Optional[SDWAModifiers] = None, vop3: Optional[VOP3PModifiers] = None, comment="") -> None:
+        super().__init__(CvtType.CVT_BF8_to_F32, dst, src, sdwa, vop3, comment)
         self.setInst("v_cvt_f32_bf8")
 
 class VCvtPkFP8toF32(VCvtInstruction):
@@ -2598,8 +2598,8 @@ class VCvtPkFP8toF32(VCvtInstruction):
         self.setInst("v_cvt_pk_f32_fp8")
 
 class VCvtPkBF8toF32(VCvtInstruction):
-    def __init__(self, dst, src, sdwa: Optional[SDWAModifiers] = None, comment="") -> None:
-        super().__init__(CvtType.CVT_PK_BF8_to_F32, dst, src, sdwa, None, comment)
+    def __init__(self, dst, src, sdwa: Optional[SDWAModifiers] = None, vop3: Optional[VOP3PModifiers] = None, comment="") -> None:
+        super().__init__(CvtType.CVT_PK_BF8_to_F32, dst, src, sdwa, vop3, comment)
         self.setInst("v_cvt_pk_f32_bf8")
 
 class VCvtPkF32toFP8(VCvtInstruction):
@@ -2721,7 +2721,7 @@ class VAddLShiftLeftU32(CompositeInstruction):
 
 class _VLShiftLeftAddU32(CommonInstruction):
     def __init__(self, dst, shiftHex, src0, src1, vop3: Optional[VOP3PModifiers] = None, comment="") -> None:
-        super().__init__(InstType.INST_U32, dst, [src0, src1, shiftHex], None, vop3, comment)
+        super().__init__(InstType.INST_U32, dst, [src0, shiftHex, src1], None, vop3, comment)
         self.setInst("v_lshl_add_u32")
 
 class VLShiftLeftAddU32(CompositeInstruction):
